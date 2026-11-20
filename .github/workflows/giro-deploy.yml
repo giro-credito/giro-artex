@@ -1,0 +1,62 @@
+# A push that changes giro/ lints the templates. It deploys only when the
+# repository variable ARTEX_DEPLOY_ENABLED is true. Create the production
+# environment and stack giro-artex-github-oidc before turning that on.
+# An upstream merge deploys only because it updates giro/UPSTREAM_SHA.
+name: giro-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - giro/**
+      - .github/workflows/giro-deploy.yml
+  pull_request:
+    paths:
+      - giro/cloudformation/**
+      - giro/parameters/**
+      - giro/scripts/**
+      - giro/docker-compose.aws.yml
+      - .github/workflows/giro-deploy.yml
+  workflow_dispatch:
+
+concurrency:
+  group: giro-artex-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+      - name: Lint templates
+        run: cfn-lint giro/cloudformation/artex.yml giro/cloudformation/github-oidc.yml
+
+  deploy:
+    needs: lint
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.ARTEX_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::920373016063:role/giro-artex-github-deploy
+          aws-region: us-east-2
+          role-session-name: giro-artex-deploy
+          role-duration-seconds: 7200
+      - name: Deploy giro-artex
+        env:
+          CFN_EXEC_ROLE_ARN: arn:aws:iam::920373016063:role/giro-artex-cfn-exec
+        run: bash giro/scripts/deploy.sh

@@ -1,0 +1,686 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Giro ARTEX. One Graviton instance in the production VPC, Postgres on that
+  instance, and an internet-facing load balancer. The load balancer accepts
+  the two production Twingate connectors. The instance has no public address.
+  This stack does not modify prod-giro-stack, giro-metabase, or giro-airflow.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - InstanceSubnetId
+          - PublicSubnet1
+          - PublicSubnet2
+          - TwingateCidrA
+          - TwingateCidrB
+          - TrustedProxyCidrs
+      - Label:
+          default: Instance
+        Parameters:
+          - AmiId
+          - InstanceType
+          - VolumeSize
+          - CpuCredits
+          - AlarmEmail
+      - Label:
+          default: Site
+        Parameters:
+          - SiteHostname
+          - CertificateArn
+          - CreateDnsRecord
+          - HostedZoneId
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Production VPC (giro-vpc, 10.0.0.0/16).
+
+  InstanceSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet for the instance. Must route 0.0.0.0/0 to the existing NAT gateway. The image build uses that path.
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First public subnet for the load balancer. Must be a different AZ from PublicSubnet2.
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second public subnet for the load balancer.
+
+  TwingateCidrA:
+    Type: String
+    Default: 3.23.119.136/32
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9])$"
+    Description: Production Twingate connector A. Allowed on ports 80 and 443.
+
+  TwingateCidrB:
+    Type: String
+    Default: 3.134.28.226/32
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9])$"
+    Description: Production Twingate connector B. Allowed on ports 80 and 443.
+
+  TrustedProxyCidrs:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9])(,([0-9]{1,3}\\.){3}[0-9]{1,3}/(3[0-2]|[12]?[0-9]))*$"
+    Description: >-
+      Written to ARTEX_TRUSTED_PROXIES. Comma-separated, no spaces. The
+      instance security group already limits port 8787 to the load balancer,
+      so the VPC CIDR is the proxy hop the login limiter should trust.
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 arm64. Changing this replaces the instance. The root
+      volume is kept because DeleteOnTermination is false.
+
+  InstanceType:
+    Type: String
+    Default: t4g.xlarge
+    AllowedValues:
+      - t4g.large
+      - t4g.xlarge
+      - t4g.2xlarge
+    Description: >-
+      t4g.xlarge is 4 vCPU and 16 GB. The image builds Chromium and the
+      recon tools, and the workers run browsers. t4g.large is 8 GB.
+
+  VolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 80
+    MaxValue: 200
+    Description: Root gp3 size in GB. Holds the OS, the image build, Postgres, task data, and keys.
+
+  CpuCredits:
+    Type: String
+    Default: standard
+    AllowedValues:
+      - standard
+      - unlimited
+    Description: >-
+      standard cannot bill surplus CPU credits and will throttle a long image
+      build. Set unlimited for that build, then return to standard if the
+      steady load stays under the T baseline.
+
+  SiteHostname:
+    Type: String
+    Default: artex.girocredito.com
+    AllowedPattern: "^[a-z0-9.-]+$"
+    Description: >-
+      Hostname for this ARTEX. The name can resolve on the public internet.
+      The load balancer and the WAF accept only the two Twingate connectors.
+
+  CertificateArn:
+    Type: String
+    AllowedPattern: "^arn:aws:acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-z0-9-]+$"
+    Description: ACM certificate in this region. The existing wildcard for girocredito.com covers the hostname.
+
+  CreateDnsRecord:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Create the alias A record for SiteHostname in HostedZoneId.
+
+  HostedZoneId:
+    Type: String
+    AllowedPattern: "^Z[A-Z0-9]+$"
+    Description: Route 53 hosted zone for girocredito.com. Used when CreateDnsRecord is true.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$"
+    Description: Optional address for status-check and unhealthy-host alarms. Confirm the SNS subscription.
+
+Conditions:
+  ManageDns: !Equals [!Ref CreateDnsRecord, "true"]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  ComposeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-source-versions
+            Status: Enabled
+            Prefix: ""
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-source"
+
+  ComposeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ComposeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ComposeBucket.Arn
+              - !Sub "${ComposeBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  DbPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "${AWS::StackName}/db-password"
+      Description: >-
+        Postgres password for the ARTEX database on the instance volume.
+        Generated once. Replacing this secret does not ALTER the role on an
+        existing Docker volume.
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-password"
+
+  TrustedProxiesParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/trusted-proxies"
+      Type: String
+      Description: ARTEX_TRUSTED_PROXIES. Read on every publish so a change does not replace the instance.
+      Value: !Ref TrustedProxyCidrs
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: artex-bootstrap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadSource
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ComposeBucket.Arn
+              - Sid: ReadSourceObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ComposeBucket.Arn}/*"
+              - Sid: ReadDbPassword
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbPasswordSecret
+              - Sid: ReadTrustedProxies
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/trusted-proxies"
+              - Sid: DescribeOwnVolume
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeInstances
+                Resource: "*"
+              - Sid: TagOwnVolume
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # No 0.0.0.0/0 rule. The panel is reached through the Twingate connectors,
+      # and the Web ACL below blocks every other client.
+      GroupDescription: HTTP and HTTPS for Giro ARTEX from the Twingate connectors only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref TwingateCidrA
+          Description: Twingate connector A redirect to HTTPS
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref TwingateCidrA
+          Description: Twingate connector A to ARTEX
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref TwingateCidrB
+          Description: Twingate connector B redirect to HTTPS
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref TwingateCidrB
+          Description: Twingate connector B to ARTEX
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Port 8788 is the recording proxy. It stays on the instance loopback
+      # and is not in this group. Container egress is not decided here: the
+      # host still needs NAT for the image build and Session Manager.
+      # giro/scripts/egress-lock.sh drops container traffic that is not the
+      # production girocredito.com names or the two model APIs.
+      GroupDescription: Giro ARTEX, port 8787 from the load balancer only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8787
+          ToPort: 8787
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Load balancer to ARTEX
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "3600"
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        - Key: deletion_protection.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Protocol: HTTP
+      Port: 8787
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 8
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "60"
+      Targets:
+        - Id: !Ref Instance
+          Port: 8787
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-tg"
+
+  TwingateIpSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub "${AWS::StackName}-twingate"
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Description: Production Twingate connectors allowed to reach ARTEX.
+      Addresses:
+        - !Ref TwingateCidrA
+        - !Ref TwingateCidrB
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-twingate"
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${AWS::StackName}-waf"
+      Scope: REGIONAL
+      DefaultAction:
+        Block: {}
+      Description: Allow Giro ARTEX from the Twingate connectors. Every other client is blocked.
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-waf"
+      Rules:
+        - Name: KnownBadInputs
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-bad-inputs"
+        - Name: AllowTwingate
+          Priority: 1
+          Action:
+            Allow: {}
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt TwingateIpSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-allow-twingate"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-waf"
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref Alb
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      DisableApiTermination: true
+      CreditSpecification:
+        CPUCredits: !Ref CpuCredits
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        # Hop 1. The host bootstrap can read credentials. A container cannot.
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref VolumeSize
+            Encrypted: true
+            DeleteOnTermination: false
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref InstanceSecurityGroup
+          SubnetId: !Ref InstanceSubnetId
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euo pipefail
+            dnf install -y docker git
+            systemctl enable --now docker
+            install -d /usr/local/lib/docker/cli-plugins /usr/libexec/docker/cli-plugins /etc/artex /opt/artex
+            compose_version=v2.39.2
+            case "$(uname -m)" in
+              aarch64) plat=aarch64 ;;
+              x86_64) plat=x86_64 ;;
+              *) echo "unsupported architecture" >&2; exit 1 ;;
+            esac
+            curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose \
+              "https://github.com/docker/compose/releases/download/$compose_version/docker-compose-linux-$plat"
+            chmod 755 /usr/local/lib/docker/cli-plugins/docker-compose
+            cp /usr/local/lib/docker/cli-plugins/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
+            docker compose version
+            cat > /etc/artex/bootstrap.env <<EOF
+            BUCKET=${BucketName}
+            DB_SECRET_ID=${DbSecretId}
+            TRUSTED_PROXIES_PARAMETER=${TrustedProxiesParameterName}
+            REGION=${AWS::Region}
+            EOF
+            chmod 644 /etc/artex/bootstrap.env
+            cat > /usr/local/bin/artex-bootstrap <<'BOOT'
+            #!/bin/bash
+            set -euo pipefail
+            # shellcheck disable=SC1091
+            source /etc/artex/bootstrap.env
+            token=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            instance_id=$(curl -fsS -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/instance-id)
+            volume_ids=$(aws ec2 describe-volumes --region "$REGION" --filters "Name=attachment.instance-id,Values=$instance_id" --query "Volumes[].VolumeId" --output text)
+            # shellcheck disable=SC2086
+            aws ec2 create-tags --region "$REGION" --resources $volume_ids --tags Key=Backup,Value=artex Key=Name,Value=giro-artex || echo "volume tag failed; snapshots will not run until this succeeds" >&2
+            aws s3 sync "s3://$BUCKET/source" /opt/artex --region "$REGION" --delete --exclude ".env" --exclude "data/*" --exclude "keys/*"
+            if [[ ! -f /opt/artex/giro/scripts/instance-up.sh ]]; then
+              echo "source bundle is not in s3 yet" >&2
+              exit 1
+            fi
+            chmod 755 /opt/artex/giro/scripts/instance-up.sh /opt/artex/giro/scripts/apply-patches.sh
+            exec /opt/artex/giro/scripts/instance-up.sh
+            BOOT
+            chmod 755 /usr/local/bin/artex-bootstrap
+            cat > /etc/systemd/system/artex.service <<'UNIT'
+            [Unit]
+            Description=Giro ARTEX
+            After=docker.service network-online.target
+            Requires=docker.service
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/usr/local/bin/artex-bootstrap
+            Restart=on-failure
+            RestartSec=30
+            TimeoutStartSec=0
+            StartLimitIntervalSec=0
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload
+            systemctl enable artex.service
+            systemctl start artex.service || true
+          - BucketName: !Ref ComposeBucket
+            DbSecretId: !Ref DbPasswordSecret
+            TrustedProxiesParameterName: !Ref TrustedProxiesParameter
+      Tags:
+        - Key: Name
+          Value: giro-artex
+        - Key: Backup
+          Value: artex
+
+  DlmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+  SnapshotPolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: Daily snapshots of the Giro ARTEX volume kept for 7 days
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt DlmRole.Arn
+      PolicyDetails:
+        PolicyType: EBS_SNAPSHOT_MANAGEMENT
+        ResourceTypes:
+          - VOLUME
+        TargetTags:
+          - Key: Backup
+            Value: artex
+        Schedules:
+          - Name: daily
+            CopyTags: true
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times:
+                - "07:00"
+            RetainRule:
+              Count: 7
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+      KmsMasterKeyId: alias/aws/sns
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  StatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-status-check"
+      AlarmDescription: Giro ARTEX instance failed an EC2 status check.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref Instance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+      OKActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  UnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-unhealthy-host"
+      AlarmDescription: Giro ARTEX failed the load balancer health check (/api/health). The first image build trips this until the container listens.
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+      OKActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ManageDns
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SiteHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+Outputs:
+  InstanceId:
+    Description: ARTEX instance. Administration is Session Manager.
+    Value: !Ref Instance
+
+  AlbDnsName:
+    Description: Load balancer hostname. The alias record points the site name here.
+    Value: !GetAtt Alb.DNSName
+
+  SiteUrl:
+    Description: Operator URL. Reachable through Twingate.
+    Value: !Sub "https://${SiteHostname}"
+
+  ComposeBucketName:
+    Description: Bucket publish.sh uploads the source tree to.
+    Value: !Ref ComposeBucket
+
+  DbPasswordSecretArn:
+    Description: Postgres password secret. The value stays in Secrets Manager.
+    Value: !Ref DbPasswordSecret
+
+  InstanceSecurityGroupId:
+    Description: Security group on the instance. Port 8787 from the load balancer only.
+    Value: !Ref InstanceSecurityGroup

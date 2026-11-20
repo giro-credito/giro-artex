@@ -1,0 +1,5 @@
+# Names the ARTEX process may call so a task can run. These are not targets.
+# egress-lock.sh accepts only these. Anything else in this file is an error.
+api.anthropic.com
+api.openai.com
+openrouter.ai

@@ -1,0 +1,7 @@
+# Hostnames the workers may connect to. One name per line.
+# giro/scripts/egress-lock.sh accepts girocredito.com and its other subdomains.
+# It rejects staging.girocredito.com, anything under it, and artex.girocredito.com.
+girocredito.com
+www.girocredito.com
+app.girocredito.com
+web.girocredito.com

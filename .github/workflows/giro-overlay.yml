@@ -1,0 +1,27 @@
+name: giro-overlay
+
+# The fork may add files under giro/ and the two giro workflow files.
+# A commit that edits the upstream tree fails this job.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  overlay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the overlay boundary
+        run: bash giro/scripts/check-overlay.sh
+      - name: Check Giro patches
+        run: bash giro/scripts/apply-patches.sh --check
+      - name: Check egress allowlists
+        run: bash giro/scripts/egress-lock.sh --check && bash giro/scripts/egress-lock.sh --self-test
+      - name: Shellcheck Giro scripts
+        run: shellcheck -S warning giro/scripts/*.sh

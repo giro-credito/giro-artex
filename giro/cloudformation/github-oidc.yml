@@ -1,0 +1,461 @@
+# One-time roles for GitHub Actions. Deploy this stack from the laptop.
+# .github/workflows/giro-deploy.yml cannot update this stack. Its role may
+# change only giro-artex, and it cannot read the database password.
+#
+# Production account 920373016063 already has the GitHub OIDC provider.
+# Do not create another one, and do not edit giro-github-deploy.
+#
+# giro-artex was created on 2026-11-20, after GitHub started putting the
+# owner id 190213379 and repository id 1465521216 in the OIDC subject.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  GitHub OIDC deploy role and CloudFormation execution role for the Giro
+  ARTEX stack. Trusts giro-artex on main only.
+
+Parameters:
+  OidcProviderArn:
+    Type: String
+    Default: arn:aws:iam::920373016063:oidc-provider/token.actions.githubusercontent.com
+    AllowedPattern: "^arn:aws:iam::[0-9]{12}:oidc-provider/token\\.actions\\.githubusercontent\\.com$"
+    Description: GitHub OIDC provider already in this account. This template does not create one.
+
+Resources:
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: giro-artex-github-deploy
+      Description: GitHub Actions deploy for Giro ARTEX. main branch only.
+      MaxSessionDuration: 7200
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref OidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:ref: refs/heads/main
+                token.actions.githubusercontent.com:job_workflow_ref: giro-credito/giro-artex/.github/workflows/giro-deploy.yml@refs/heads/main
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - repo:giro-credito/giro-artex:environment:production
+                  - repo:giro-credito@190213379/giro-artex@1465521216:environment:production
+      Policies:
+        - PolicyName: DeployArtexStack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ChangeTheArtexStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:UpdateTerminationProtection
+                  - cloudformation:CancelUpdateStack
+                  - cloudformation:ContinueUpdateRollback
+                  - cloudformation:TagResource
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/giro-artex
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/giro-artex/*
+              - Sid: ReadTemplateSummary
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStacks
+                Resource: "*"
+              - Sid: PassExecRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CloudFormationExecRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+              - Sid: PublishSourceBundle
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: arn:aws:s3:::giro-artex-composebucket-*
+              - Sid: PublishSourceObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: arn:aws:s3:::giro-artex-composebucket-*/*
+              - Sid: SeeArtexInstance
+                Effect: Allow
+                Action: ssm:DescribeInstanceInformation
+                Resource: "*"
+              - Sid: RunRefreshOnArtex
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/Name: giro-artex
+              - Sid: UseRefreshDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript
+                  - !Sub arn:aws:ssm:${AWS::Region}:*:document/AWS-RunShellScript
+              - Sid: ReadRefreshResult
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: giro-artex-github-deploy
+        - Key: Service
+          Value: artex
+        - Key: ManagedBy
+          Value: cloudformation
+
+  CloudFormationExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: giro-artex-cfn-exec
+      Description: CloudFormation execution role for the Giro ARTEX stack.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ExecuteArtexStack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DescribeEc2
+                Effect: Allow
+                Action: ec2:Describe*
+                Resource: "*"
+              - Sid: RunArtexInstance
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - !Sub arn:aws:ec2:${AWS::Region}::image/ami-*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/subnet-05caafd35d239c496
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:key-pair/*
+                Condition:
+                  StringEquals:
+                    ec2:InstanceType:
+                      - t4g.large
+                      - t4g.xlarge
+                      - t4g.2xlarge
+              - Sid: ChangeArtexInstance
+                Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:ModifyInstanceCreditSpecification
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Name: giro-artex
+              - Sid: CreateArtexSecurityGroup
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    ec2:Vpc: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/vpc-0620d202aebd39cfc
+              - Sid: ManageArtexSecurityGroups
+                Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DeleteSecurityGroup
+                  - ec2:ModifySecurityGroupRules
+                  - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+                  - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/aws:cloudformation:stack-name: giro-artex
+              - Sid: TagWhileCreating
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction:
+                      - RunInstances
+                      - CreateSecurityGroup
+                      - CreateVolume
+                      - CreateNetworkInterface
+              - Sid: TagArtexResources
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/aws:cloudformation:stack-name: giro-artex
+              - Sid: ModifyArtexVolume
+                Effect: Allow
+                Action:
+                  - ec2:ModifyVolume
+                  - ec2:ModifyVolumeAttribute
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/aws:cloudformation:stack-name: giro-artex
+              - Sid: DenyDeleteProductionGroups
+                Effect: Deny
+                Action: ec2:DeleteSecurityGroup
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/sg-01aa895ca77578623
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/sg-069ee0299cd186a32
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/sg-04274360e5f134309
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/sg-071ab1bad266f6225
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/sg-0f2458b7779a1a8c0
+              - Sid: DenyOtherNetworks
+                Effect: Deny
+                Action:
+                  - ec2:DeleteVpc
+                  - ec2:DeleteSubnet
+                  - ec2:DeleteNatGateway
+                  - ec2:CreateNatGateway
+                  - ec2:DeleteInternetGateway
+                  - ec2:DetachInternetGateway
+                Resource: "*"
+              - Sid: ManageStackRoles
+                Effect: Allow
+                Action:
+                  - iam:Get*
+                  - iam:List*
+                  - iam:AddRoleToInstanceProfile
+                  - iam:AttachRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:CreateRole
+                  - iam:DeleteInstanceProfile
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:TagInstanceProfile
+                  - iam:TagRole
+                  - iam:UntagInstanceProfile
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-artex-InstanceRole-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-artex-DlmRole-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/giro-artex-InstanceProfile-*
+              - Sid: PassInstanceAndSnapshotRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-artex-InstanceRole-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-artex-DlmRole-*
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ec2.amazonaws.com
+                      - dlm.amazonaws.com
+              - Sid: DenyAttachUnrelatedPolicies
+                Effect: Deny
+                Action: iam:AttachRolePolicy
+                Resource: "*"
+                Condition:
+                  ArnNotEquals:
+                    iam:PolicyARN:
+                      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+                      - arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+              - Sid: DenyTouchingOtherRoles
+                Effect: Deny
+                Action: iam:*
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-artex-github-deploy
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-artex-cfn-exec
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-github-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-cfn-exec
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-twingate-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-metabase-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/giro-airflow-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/*giro-stack-*
+              - Sid: ManageSourceBucket
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:DeleteBucketPolicy
+                  - s3:Get*
+                  - s3:ListBucket
+                  - s3:PutBucket*
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                Resource:
+                  - arn:aws:s3:::giro-artex-composebucket-*
+                  - arn:aws:s3:::giro-artex-composebucket-*/*
+              - Sid: ManageDbSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:giro-artex/db-password-*
+              - Sid: DenySecretValues
+                Effect: Deny
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource: "*"
+              - Sid: ManageParameters
+                Effect: Allow
+                Action: ssm:*
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/giro-artex/*
+              - Sid: DescribeLoadBalancing
+                Effect: Allow
+                Action: elasticloadbalancing:Describe*
+                Resource: "*"
+              - Sid: ManageArtexLoadBalancer
+                Effect: Allow
+                Action:
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:CreateListener
+                  - elasticloadbalancing:CreateLoadBalancer
+                  - elasticloadbalancing:CreateTargetGroup
+                  - elasticloadbalancing:DeleteListener
+                  - elasticloadbalancing:DeleteLoadBalancer
+                  - elasticloadbalancing:DeleteTargetGroup
+                  - elasticloadbalancing:DeregisterTargets
+                  - elasticloadbalancing:ModifyListener
+                  - elasticloadbalancing:ModifyLoadBalancerAttributes
+                  - elasticloadbalancing:ModifyTargetGroup
+                  - elasticloadbalancing:ModifyTargetGroupAttributes
+                  - elasticloadbalancing:RegisterTargets
+                  - elasticloadbalancing:RemoveTags
+                  - elasticloadbalancing:SetSecurityGroups
+                  - elasticloadbalancing:SetSubnets
+                Resource:
+                  - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/giro-artex-alb/*
+                  - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/giro-artex-tg/*
+                  - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/giro-artex-alb/*
+              - Sid: ReadWaf
+                Effect: Allow
+                Action:
+                  - wafv2:Describe*
+                  - wafv2:Get*
+                  - wafv2:List*
+                Resource: "*"
+              - Sid: ManageArtexWaf
+                Effect: Allow
+                Action:
+                  - wafv2:AssociateWebACL
+                  - wafv2:CreateIPSet
+                  - wafv2:CreateWebACL
+                  - wafv2:DeleteIPSet
+                  - wafv2:DeleteWebACL
+                  - wafv2:DisassociateWebACL
+                  - wafv2:GetIPSet
+                  - wafv2:GetWebACL
+                  - wafv2:TagResource
+                  - wafv2:UntagResource
+                  - wafv2:UpdateIPSet
+                  - wafv2:UpdateWebACL
+                Resource:
+                  - !Sub arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:regional/webacl/giro-artex-waf/*
+                  - !Sub arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:regional/ipset/giro-artex-twingate/*
+                  - !Sub arn:aws:wafv2:${AWS::Region}:aws:regional/managedruleset/*
+                  - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/giro-artex-alb/*
+              - Sid: ManageDnsRecord
+                Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                Resource: arn:aws:route53:::hostedzone/Z05428231QF0G4RTRRFW0
+              - Sid: ReadDnsChange
+                Effect: Allow
+                Action: route53:GetChange
+                Resource: arn:aws:route53:::change/*
+              - Sid: ManageSnapshotPolicy
+                Effect: Allow
+                Action: dlm:*
+                Resource: !Sub arn:aws:dlm:${AWS::Region}:${AWS::AccountId}:policy/*
+              - Sid: DescribeAlarms
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: "*"
+              - Sid: ManageArtexAlarms
+                Effect: Allow
+                Action:
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:TagResource
+                Resource:
+                  - !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:giro-artex-status-check
+                  - !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:giro-artex-unhealthy-host
+              - Sid: ManageAlarmTopic
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:TagResource
+                  - sns:UntagResource
+                Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:giro-artex-alarms
+              - Sid: UseSnsKey
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "sns.${AWS::Region}.amazonaws.com"
+      Tags:
+        - Key: Name
+          Value: giro-artex-cfn-exec
+        - Key: Service
+          Value: artex
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  DeployRoleArn:
+    Description: Role assumed by .github/workflows/giro-deploy.yml.
+    Value: !GetAtt GitHubDeployRole.Arn
+
+  ExecRoleArn:
+    Description: Role CloudFormation assumes while it updates giro-artex. Passed as CFN_EXEC_ROLE_ARN.
+    Value: !GetAtt CloudFormationExecRole.Arn

@@ -1,0 +1,21 @@
+# Production values for giro/cloudformation/artex.yml.
+# Account 920373016063, us-east-2, vpc giro-vpc. The same network giro-metabase uses.
+# Twingate addresses are the current production connectors (giro-airflow).
+# 3.15.0.126 and 3.134.239.171 are the retired connectors and are not listed.
+# Changing AmiId or InstanceType replaces the instance. The root volume is kept.
+
+VpcId=vpc-0620d202aebd39cfc
+InstanceSubnetId=subnet-05caafd35d239c496
+PublicSubnet1=subnet-08036410f0594b7e0
+PublicSubnet2=subnet-06cc5fa6943f9ace8
+TwingateCidrA=3.23.119.136/32
+TwingateCidrB=3.134.28.226/32
+AmiId=ami-0b1a7e5b539c6dfb6
+InstanceType=t4g.xlarge
+VolumeSize=100
+CpuCredits=standard
+SiteHostname=artex.girocredito.com
+CertificateArn=arn:aws:acm:us-east-2:920373016063:certificate/464c0ea4-3cf9-47e0-8f45-8fdff4c60e46
+CreateDnsRecord=true
+HostedZoneId=Z05428231QF0G4RTRRFW0
+TrustedProxyCidrs=10.0.0.0/16
