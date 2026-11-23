@@ -28,6 +28,7 @@ umask 077
 printf 'POSTGRES_PASSWORD=%s\nARTEX_BIND_ADDR=%s\nARTEX_TRUSTED_PROXIES=%s\n' \
   "$db_pass" "$bind" "$proxies" >/opt/artex/.env
 chmod 600 /opt/artex/.env
+chmod 755 giro/scripts/egress-lock.sh
 unset db_pass token
 
 # The image build fetches toolchains. Open container egress for that, then

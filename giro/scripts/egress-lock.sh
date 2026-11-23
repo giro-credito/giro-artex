@@ -122,6 +122,19 @@ write_rules() {
     echo "*filter"
     echo ":DOCKER-USER - [0:0]"
     echo "-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN"
+    # Docker's resolver at 127.0.0.11 forwards the lookup to the host's
+    # nameserver, and that packet leaves on the default interface. Without
+    # this, every name in the allowlist fails closed. Public resolvers are
+    # not added.
+    local ns
+    while IFS= read -r ns; do
+      [[ -z "$ns" || "$ns" == "127."* ]] && continue
+      if public_ipv4 "$ns"; then
+        continue
+      fi
+      echo "-A DOCKER-USER -o ${ext} -p udp -d ${ns} --dport 53 -j RETURN"
+      echo "-A DOCKER-USER -o ${ext} -p tcp -d ${ns} --dport 53 -j RETURN"
+    done < <(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf)
     if [[ "$mode" == allow ]]; then
       for ip in "$@"; do
         [[ "$seen" == *" ${ip} "* ]] && continue

@@ -524,7 +524,7 @@ Resources:
               echo "source bundle is not in s3 yet" >&2
               exit 1
             fi
-            chmod 755 /opt/artex/giro/scripts/instance-up.sh /opt/artex/giro/scripts/apply-patches.sh
+            chmod 755 /opt/artex/giro/scripts/instance-up.sh /opt/artex/giro/scripts/apply-patches.sh /opt/artex/giro/scripts/egress-lock.sh
             exec /opt/artex/giro/scripts/instance-up.sh
             BOOT
             chmod 755 /usr/local/bin/artex-bootstrap
