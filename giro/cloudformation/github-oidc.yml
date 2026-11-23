@@ -146,23 +146,29 @@ Resources:
                 Effect: Allow
                 Action: ec2:Describe*
                 Resource: "*"
-              - Sid: RunArtexInstance
+              # Instance type applies only to the instance resource. The same
+              # condition on the network interface, volume, image, subnet, or
+              # security group makes RunInstances deny those resources.
+              - Sid: RunArtexInstanceType
                 Effect: Allow
                 Action: ec2:RunInstances
-                Resource:
-                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
-                  - !Sub arn:aws:ec2:${AWS::Region}::image/ami-*
-                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
-                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
-                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/subnet-05caafd35d239c496
-                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
-                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:key-pair/*
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
                 Condition:
                   StringEquals:
                     ec2:InstanceType:
                       - t4g.large
                       - t4g.xlarge
                       - t4g.2xlarge
+              - Sid: RunArtexInstance
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}::image/ami-*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/subnet-05caafd35d239c496
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:key-pair/*
               - Sid: ChangeArtexInstance
                 Effect: Allow
                 Action:
@@ -175,13 +181,17 @@ Resources:
                 Condition:
                   StringEquals:
                     ec2:ResourceTag/Name: giro-artex
+              # CreateSecurityGroup is authorized twice: once on security-group/*
+              # and once on the VPC. The ec2:Vpc condition is not present on
+              # either check, so the VPC ARN is what keeps this in giro-vpc.
               - Sid: CreateArtexSecurityGroup
                 Effect: Allow
                 Action: ec2:CreateSecurityGroup
-                Resource: "*"
-                Condition:
-                  StringEquals:
-                    ec2:Vpc: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/vpc-0620d202aebd39cfc
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
+              - Sid: CreateSecurityGroupInVpc
+                Effect: Allow
+                Action: ec2:CreateSecurityGroup
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/vpc-0620d202aebd39cfc
               - Sid: ManageArtexSecurityGroups
                 Effect: Allow
                 Action:
@@ -193,10 +203,10 @@ Resources:
                   - ec2:ModifySecurityGroupRules
                   - ec2:UpdateSecurityGroupRuleDescriptionsIngress
                   - ec2:UpdateSecurityGroupRuleDescriptionsEgress
-                Resource: "*"
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*
                 Condition:
                   StringEquals:
-                    aws:ResourceTag/aws:cloudformation:stack-name: giro-artex
+                    ec2:Vpc: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/vpc-0620d202aebd39cfc
               - Sid: TagWhileCreating
                 Effect: Allow
                 Action: ec2:CreateTags
@@ -329,6 +339,11 @@ Resources:
                   - secretsmanager:TagResource
                   - secretsmanager:UntagResource
                 Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:giro-artex/db-password-*
+              # GenerateSecretString calls this. It has no resource and cannot read a secret.
+              - Sid: GenerateDbPassword
+                Effect: Allow
+                Action: secretsmanager:GetRandomPassword
+                Resource: "*"
               - Sid: DenySecretValues
                 Effect: Deny
                 Action:
@@ -362,6 +377,7 @@ Resources:
                   - elasticloadbalancing:RemoveTags
                   - elasticloadbalancing:SetSecurityGroups
                   - elasticloadbalancing:SetSubnets
+                  - elasticloadbalancing:SetWebACL
                 Resource:
                   - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/giro-artex-alb/*
                   - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/giro-artex-tg/*
@@ -392,6 +408,7 @@ Resources:
                   - !Sub arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:regional/webacl/giro-artex-waf/*
                   - !Sub arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:regional/ipset/giro-artex-twingate/*
                   - !Sub arn:aws:wafv2:${AWS::Region}:aws:regional/managedruleset/*
+                  - !Sub arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:regional/managedruleset/*/*
                   - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/giro-artex-alb/*
               - Sid: ManageDnsRecord
                 Effect: Allow
