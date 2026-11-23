@@ -130,6 +130,7 @@ if want_web; then
   run_step "web polling tests" bash -c 'cd web && npm run test:polling'
   run_step "web replay tests" bash -c 'cd web && npm run test:replay'
   run_step "web upload tests" bash -c 'cd web && npm run test:upload'
+  run_step "web traffic stream tests" bash -c 'cd web && npm run test:traffic-stream'
   if [ "$FULL" -eq 1 ]; then
     run_step "web static build" bash -c 'cd web && npm run build:static'
   fi
@@ -149,6 +150,7 @@ if [ "$GO_ONLY" -eq 0 ] && [ "$WEB_ONLY" -eq 0 ]; then
     printf 'note: shellcheck is not installed; skipping the shellcheck step\n'
   fi
   run_step "posture check" python3 scripts/posture_check_test.py
+  run_step "benchmark tests" python3 -m unittest discover -s scripts/benchmark -p 'test_*.py' -v
   run_step "changelog section tests" bash scripts/test-extract-changelog-section.sh
   run_step "bot context tests" bash scripts/test-bot-context.sh
 fi
