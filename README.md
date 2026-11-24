@@ -344,6 +344,12 @@ docker compose up -d --build
 # → http://localhost:8787
 ```
 
+The checkout build needs the Docker **buildx** plugin (BuildKit). Docker Desktop and
+get.docker.com include it; distro packages and Homebrew's docker CLI (Colima) may not. If
+`docker buildx version` fails, install `docker-buildx-plugin` or `docker-buildx`, or on macOS
+`brew install docker-buildx`. Without it the build stops at the first stage with
+`failed to parse platform`.
+
 The release workflow publishes a multi-arch image (`linux/amd64`, `linux/arm64`) to GitHub
 Container Registry on each `v*` tag, with tags `:latest`, `:v<version>`, and `:<version>`.
 v0.7.0 predates that step, so there is no `artex` package yet: until the next tagged release,
@@ -871,7 +877,8 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 - Backend: `go run ./cmd/artex` (without `-tags embedui`, the frontend is not embedded)
 - Frontend: `cd web && npm run dev` (`/api` is reverse-proxied to the backend, with hot reload)
 - Tests: `go test ./...`
-- Reproduce all CI checks locally: `./scripts/verify.sh` (add `--full` for `-race` and the static web build)
+- Reproduce the fast CI checks locally: `./scripts/verify.sh` (add `--full` for `-race` and the static web build; add `--security` for `govulncheck`)
+- Security scan: install `govulncheck` and run `./scripts/verify.sh --security` (CI runs this on every push and pull request)
 - Mock preview (no backend): `cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
 
 ---
