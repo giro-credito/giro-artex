@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-# Fail when this fork differs from the pinned upstream commit outside the Giro overlay.
+# Fail when this fork differs from upstream outside the Giro overlay.
+#
+# giro/UPSTREAM_SHA is the oldest acknowledged upstream commit. GitHub's
+# Sync fork button merges a newer upstream commit and does not change that
+# file. A merge titled "Merge branch 'BaaRai:main' into ..." (or a merge of
+# upstream/main) may be the comparison base when the pin is its ancestor and
+# every path that differs from its second parent is still inside the overlay.
+# Moving the pin remains what rolls that upstream onto the instance.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -10,13 +17,13 @@ if [[ ! -f giro/UPSTREAM_SHA ]]; then
   exit 1
 fi
 
-sha="$(tr -d '[:space:]' < giro/UPSTREAM_SHA)"
-if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+pin="$(tr -d '[:space:]' < giro/UPSTREAM_SHA)"
+if [[ ! "$pin" =~ ^[0-9a-f]{40}$ ]]; then
   echo "giro/UPSTREAM_SHA must be one 40-character commit id." >&2
   exit 1
 fi
-if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
-  echo "Commit ${sha} is not in this clone. Fetch the full history." >&2
+if ! git cat-file -e "${pin}^{commit}" 2>/dev/null; then
+  echo "Commit ${pin} is not in this clone. Fetch the full history." >&2
   exit 1
 fi
 
@@ -28,6 +35,41 @@ allowed() {
   esac
   return 1
 }
+
+# Newest upstream commit merged on top of the pin. The final diff is what
+# rejects a product edit made after that merge, so the failure names that
+# edit rather than every upstream file since the old pin. CHECK_INDEX is the
+# in-progress sync, which compares the index to the pin file it just wrote.
+upstream_base() {
+  local merge subject p2
+  if ! git merge-base --is-ancestor "$pin" HEAD; then
+    printf '%s\n' "$pin"
+    return
+  fi
+  while IFS= read -r merge; do
+    [[ -z "$merge" ]] && continue
+    subject="$(git log -1 --format=%s "$merge")"
+    case "$subject" in
+      "Merge branch 'BaaRai:main' into "* | \
+        "Merge remote-tracking branch 'upstream/main'"* | \
+        "Merge branch 'main' of "*"BaaRai/ARTEX"*) ;;
+      *) continue ;;
+    esac
+    p2="$(git rev-parse -q --verify "${merge}^2" || true)"
+    [[ -n "$p2" ]] || continue
+    git merge-base --is-ancestor "$pin" "$p2" || continue
+    git merge-base --is-ancestor "$p2" HEAD || continue
+    printf '%s\n' "$p2"
+    return
+  done < <(git rev-list --merges --topo-order "${pin}..HEAD")
+  printf '%s\n' "$pin"
+}
+
+if [[ "${CHECK_INDEX:-}" == 1 ]]; then
+  sha="$pin"
+else
+  sha="$(upstream_base)"
+fi
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
@@ -59,3 +101,6 @@ if ((${#bad[@]} > 0)); then
 fi
 
 echo "Overlay matches ${sha}."
+if [[ "$sha" != "$pin" ]]; then
+  echo "giro/UPSTREAM_SHA still records ${pin}. Moving it is what deploys that upstream."
+fi

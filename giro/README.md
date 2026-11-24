@@ -2,7 +2,7 @@
 
 This fork tracks [BaaRai/ARTEX](https://github.com/BaaRai/ARTEX). Giro's files live under `giro/` and in two workflow files, `.github/workflows/giro-overlay.yml` and `.github/workflows/giro-deploy.yml`. Everything else is upstream.
 
-`giro/UPSTREAM_SHA` is the upstream commit this branch is based on. `giro/scripts/check-overlay.sh` fails when any other path differs from that commit. The overlay workflow runs that check on every push and pull request, with full git history.
+`giro/UPSTREAM_SHA` is the oldest upstream commit this branch has recorded. `giro/scripts/check-overlay.sh` fails when a path outside the overlay differs from that commit, or from a newer upstream commit already merged by Sync fork or `git merge upstream/main`. The overlay workflow runs that check on every push and pull request, with full git history. Sync fork does not move the pin, and production does not roll forward until the pin does.
 
 ## Sync
 
